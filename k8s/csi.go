@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,16 +16,20 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	gexporter "github.com/PlakarKorp/integration-grpc/exporter"
 	gimporter "github.com/PlakarKorp/integration-grpc/importer"
 	"github.com/PlakarKorp/integrations/k8s/mtls"
 	"github.com/PlakarKorp/kloset/connectors"
+	"github.com/PlakarKorp/kloset/connectors/exporter"
 	"github.com/PlakarKorp/kloset/connectors/importer"
 	vs "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -50,7 +55,9 @@ const (
 	fsPath = "/data"
 
 	// path at which a raw block PVC is exposed inside the pod.
-	blockPath = "/dev/plakarvol"
+	blockPath              = "/dev/plakarvol"
+	connectionRetryInitial = 100 * time.Millisecond
+	connectionRetryMax     = time.Second
 )
 
 var fatalWaiting = map[string]bool{
@@ -445,7 +452,6 @@ func (k *k8s) fsServer(ctx context.Context, op, ns string, pvc *corev1.Persisten
 	if err != nil {
 		return nil, err
 	}
-
 	lw := &cache.ListWatch{
 		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
 			opts.FieldSelector = "metadata.name=" + pod.Name
@@ -501,6 +507,43 @@ func (k *k8s) delpod(ctx context.Context, pod *corev1.Pod) {
 	if err != nil {
 		log.Printf("failed to delete pod %s/%s: %s",
 			pod.Namespace, pod.Name, err)
+	}
+}
+
+func transientConnectionError(err error) bool {
+	if status.Code(err) == codes.Unavailable {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED)
+}
+
+func retryConnectionSetup[T any](ctx context.Context, setup func(context.Context) (T, error)) (T, error) {
+	var zero T
+	delay := connectionRetryInitial
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			return zero, fmt.Errorf("connection setup retries stopped after %v: %w", lastErr, err)
+		}
+		value, err := setup(ctx)
+		if err == nil {
+			return value, nil
+		}
+		if !transientConnectionError(err) {
+			return zero, err
+		}
+		lastErr = err
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return zero, fmt.Errorf("connection setup failed after transient error %v: %w", lastErr, ctx.Err())
+		case <-timer.C:
+		}
+		delay *= 2
+		if delay > connectionRetryMax {
+			delay = connectionRetryMax
+		}
 	}
 }
 
@@ -587,9 +630,11 @@ func (k *k8s) consume(ctx context.Context, cert *tls.Certificate, peer [32]byte,
 		MaxConcurrency:  k.opts.MaxConcurrency,
 	}
 
-	importer, err := gimporter.NewImporter(ctx, client, opts, proto, map[string]string{
-		"location":         proto + "://" + podpath,
-		"dont_traverse_fs": "true",
+	importer, err := retryConnectionSetup(ctx, func(ctx context.Context) (importer.Importer, error) {
+		return gimporter.NewImporter(ctx, client, opts, proto, map[string]string{
+			"location":         proto + "://" + podpath,
+			"dont_traverse_fs": "true",
+		})
 	})
 	if err != nil {
 		return fmt.Errorf("failed to instantiate the importer: %w", err)
@@ -719,7 +764,9 @@ func (k *k8s) podRestore(ctx context.Context, fp *fspod, records <-chan *connect
 	if proto == "fs" && k.skipRootPermsAndTime {
 		config["skip_root_perms_and_time"] = "true"
 	}
-	exporter, err := gexporter.NewExporter(ctx, client, opts, proto, config)
+	exporter, err := retryConnectionSetup(ctx, func(ctx context.Context) (exporter.Exporter, error) {
+		return gexporter.NewExporter(ctx, client, opts, proto, config)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to instantiate the exporter: %w", err)
 	}

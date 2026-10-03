@@ -1,13 +1,19 @@
 package k8s
 
 import (
+	"context"
 	"errors"
+	"net"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/PlakarKorp/integrations/k8s/mtls"
 	vs "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	snapfake "github.com/kubernetes-csi/external-snapshotter/client/v8/clientset/versioned/fake"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -704,7 +710,6 @@ func fsServerTestK8s(t *testing.T, pvc *corev1.PersistentVolumeClaim) *k8s {
 		obj.SetResourceVersion("1")
 		return false, nil, nil
 	})
-
 	_, fp, err := mtls.Gencert()
 	require.NoError(t, err)
 	podlog := []byte("plakar-pubkey: " + mtls.Fingerprint(fp) + "\n")
@@ -728,6 +733,59 @@ func fsServerTestK8s(t *testing.T, pvc *corev1.PersistentVolumeClaim) *k8s {
 	}))
 
 	return k
+}
+
+func TestRetryConnectionSetup(t *testing.T) {
+	t.Parallel()
+	t.Run("recovers from refused connection", func(t *testing.T) {
+		calls := 0
+		got, err := retryConnectionSetup(t.Context(), func(context.Context) (string, error) {
+			calls++
+			if calls < 3 {
+				return "", &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}
+			}
+			return "connected", nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, "connected", got)
+		require.Equal(t, 3, calls)
+	})
+	t.Run("stops on deadline", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+		defer cancel()
+		_, err := retryConnectionSetup(ctx, func(context.Context) (string, error) { return "", status.Error(codes.Unavailable, "starting") })
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.Contains(t, err.Error(), "transient error")
+	})
+	t.Run("stops on cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		calls := 0
+		started := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			_, err := retryConnectionSetup(ctx, func(context.Context) (string, error) {
+				calls++
+				if calls == 1 {
+					close(started)
+				}
+				return "", status.Error(codes.Unavailable, "starting")
+			})
+			done <- err
+		}()
+		<-started
+		cancel()
+		err := <-done
+		require.ErrorIs(t, err, context.Canceled)
+		require.GreaterOrEqual(t, calls, 1)
+	})
+	t.Run("returns permanent error immediately", func(t *testing.T) {
+		calls := 0
+		want := errors.New("bad certificate")
+		_, err := retryConnectionSetup(t.Context(), func(context.Context) (string, error) { calls++; return "", want })
+		require.ErrorIs(t, err, want)
+		require.Equal(t, 1, calls)
+	})
 }
 
 func TestFsServer(t *testing.T) {
