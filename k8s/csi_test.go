@@ -739,7 +739,7 @@ func TestRetryConnectionSetup(t *testing.T) {
 	t.Parallel()
 	t.Run("recovers from refused connection", func(t *testing.T) {
 		calls := 0
-		got, err := retryConnectionSetup(t.Context(), func(context.Context) (string, error) {
+		got, err := retryConnectionSetup(t.Context(), "test", func(context.Context) (string, error) {
 			calls++
 			if calls < 3 {
 				return "", &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}
@@ -753,9 +753,9 @@ func TestRetryConnectionSetup(t *testing.T) {
 	t.Run("stops on deadline", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
 		defer cancel()
-		_, err := retryConnectionSetup(ctx, func(context.Context) (string, error) { return "", status.Error(codes.Unavailable, "starting") })
+		_, err := retryConnectionSetup(ctx, "test", func(context.Context) (string, error) { return "", status.Error(codes.Unavailable, "starting") })
 		require.ErrorIs(t, err, context.DeadlineExceeded)
-		require.Contains(t, err.Error(), "transient error")
+		require.Contains(t, err.Error(), "timed out")
 	})
 	t.Run("stops on cancellation", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
@@ -764,7 +764,7 @@ func TestRetryConnectionSetup(t *testing.T) {
 		started := make(chan struct{})
 		done := make(chan error, 1)
 		go func() {
-			_, err := retryConnectionSetup(ctx, func(context.Context) (string, error) {
+			_, err := retryConnectionSetup(ctx, "test", func(context.Context) (string, error) {
 				calls++
 				if calls == 1 {
 					close(started)
@@ -782,7 +782,7 @@ func TestRetryConnectionSetup(t *testing.T) {
 	t.Run("returns permanent error immediately", func(t *testing.T) {
 		calls := 0
 		want := errors.New("bad certificate")
-		_, err := retryConnectionSetup(t.Context(), func(context.Context) (string, error) { calls++; return "", want })
+		_, err := retryConnectionSetup(t.Context(), "test", func(context.Context) (string, error) { calls++; return "", want })
 		require.ErrorIs(t, err, want)
 		require.Equal(t, 1, calls)
 	})

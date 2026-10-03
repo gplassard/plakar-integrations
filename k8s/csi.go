@@ -56,8 +56,9 @@ const (
 
 	// path at which a raw block PVC is exposed inside the pod.
 	blockPath              = "/dev/plakarvol"
-	connectionRetryInitial = 100 * time.Millisecond
-	connectionRetryMax     = time.Second
+	connectionRetryInitial = 250 * time.Millisecond
+	connectionRetryMax     = 5 * time.Second
+	connectionRetryTimeout = 2 * time.Minute
 )
 
 var fatalWaiting = map[string]bool{
@@ -517,27 +518,36 @@ func transientConnectionError(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED)
 }
 
-func retryConnectionSetup[T any](ctx context.Context, setup func(context.Context) (T, error)) (T, error) {
+func retryConnectionSetup[T any](ctx context.Context, operation string, setup func(context.Context) (T, error)) (T, error) {
 	var zero T
+	ctx, cancel := context.WithTimeout(ctx, connectionRetryTimeout)
+	defer cancel()
+	started := time.Now()
+	attempt := 0
 	delay := connectionRetryInitial
 	var lastErr error
 	for {
+		attempt++
 		if err := ctx.Err(); err != nil {
-			return zero, fmt.Errorf("connection setup retries stopped after %v: %w", lastErr, err)
+			return zero, fmt.Errorf("%s connection setup stopped after %s and %d attempts (last error: %v): %w", operation, time.Since(started).Round(time.Second), attempt-1, lastErr, err)
 		}
 		value, err := setup(ctx)
 		if err == nil {
+			if attempt > 1 {
+				log.Printf("%s connection established after %s and %d attempts", operation, time.Since(started).Round(time.Millisecond), attempt)
+			}
 			return value, nil
 		}
 		if !transientConnectionError(err) {
 			return zero, err
 		}
 		lastErr = err
+		log.Printf("transient %s connection setup failure on attempt %d; retrying in %s: %v", operation, attempt, delay, err)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return zero, fmt.Errorf("connection setup failed after transient error %v: %w", lastErr, ctx.Err())
+			return zero, fmt.Errorf("%s connection setup timed out after %s and %d attempts (last transient error: %v): %w", operation, time.Since(started).Round(time.Second), attempt, lastErr, ctx.Err())
 		case <-timer.C:
 		}
 		delay *= 2
@@ -630,7 +640,7 @@ func (k *k8s) consume(ctx context.Context, cert *tls.Certificate, peer [32]byte,
 		MaxConcurrency:  k.opts.MaxConcurrency,
 	}
 
-	importer, err := retryConnectionSetup(ctx, func(ctx context.Context) (importer.Importer, error) {
+	importer, err := retryConnectionSetup(ctx, "importer", func(ctx context.Context) (importer.Importer, error) {
 		return gimporter.NewImporter(ctx, client, opts, proto, map[string]string{
 			"location":         proto + "://" + podpath,
 			"dont_traverse_fs": "true",
@@ -764,7 +774,7 @@ func (k *k8s) podRestore(ctx context.Context, fp *fspod, records <-chan *connect
 	if proto == "fs" && k.skipRootPermsAndTime {
 		config["skip_root_perms_and_time"] = "true"
 	}
-	exporter, err := retryConnectionSetup(ctx, func(ctx context.Context) (exporter.Exporter, error) {
+	exporter, err := retryConnectionSetup(ctx, "exporter", func(ctx context.Context) (exporter.Exporter, error) {
 		return gexporter.NewExporter(ctx, client, opts, proto, config)
 	})
 	if err != nil {
