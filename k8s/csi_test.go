@@ -750,6 +750,19 @@ func TestRetryConnectionSetup(t *testing.T) {
 		require.Equal(t, "connected", got)
 		require.Equal(t, 3, calls)
 	})
+	t.Run("recovers from integration grpc unavailable wrapper", func(t *testing.T) {
+		calls := 0
+		got, err := retryConnectionSetup(t.Context(), "test", func(context.Context) (string, error) {
+			calls++
+			if calls == 1 {
+				return "", errors.New(`I/O error communicating with the integration (connection error: desc = "transport: Error while dialing: dial tcp 10.42.0.228:8080: connect: connection refused")`)
+			}
+			return "connected", nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, "connected", got)
+		require.Equal(t, 2, calls)
+	})
 	t.Run("stops on deadline", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
 		defer cancel()

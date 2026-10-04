@@ -515,6 +515,11 @@ func transientConnectionError(err error) bool {
 	if status.Code(err) == codes.Unavailable {
 		return true
 	}
+	// integration-grpc translates codes.Unavailable into this plain-text
+	// error, discarding the original gRPC status code.
+	if strings.HasPrefix(err.Error(), "I/O error communicating with the integration (") {
+		return true
+	}
 	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED)
 }
 
