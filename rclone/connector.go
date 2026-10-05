@@ -203,13 +203,17 @@ func (r *Rclone) Export(ctx context.Context, records <-chan *connectors.Record, 
 }
 
 func (r *Rclone) Create(ctx context.Context, conf []byte) error {
+	rclonefs.Infof(r.fs, "Creating Kloset repository in %s:%s", r.typ, r.base)
+
 	_, err := r.fs.NewObject(ctx, "CONFIG")
 	if err == nil {
+		rclonefs.Infof(r.fs, "Repository CONFIG already exists in %s:%s", r.typ, r.base)
 		return fmt.Errorf("kloset already initialized")
 	}
 	if err != nil && !errors.Is(err, rclonefs.ErrorObjectNotFound) {
 		return fmt.Errorf("failed to check whether CONFIG exists: %w", err)
 	}
+	rclonefs.Infof(r.fs, "CONFIG not found in %s:%s; uploading %d bytes", r.typ, r.base, len(conf))
 
 	obj, err := r.fs.Put(ctx, bytes.NewReader(conf), &objectinfo{&connectors.Record{
 		Pathname: "CONFIG",
@@ -221,15 +225,17 @@ func (r *Rclone) Create(ctx context.Context, conf []byte) error {
 		},
 	}})
 	if obj != nil && err != nil {
-		return fmt.Errorf("failed to completely write CONFIG: %w", err)
+		return fmt.Errorf("failed to completely write CONFIG to %s:%s (%d bytes): %w", r.typ, r.base, len(conf), err)
 	}
 	if err != nil {
-		return fmt.Errorf("failed to create CONFIG: %w", err)
+		return fmt.Errorf("failed to create CONFIG in %s:%s (%d bytes): %w", r.typ, r.base, len(conf), err)
 	}
+	rclonefs.Infof(r.fs, "CONFIG upload completed in %s:%s", r.typ, r.base)
 
 	for _, dir := range []string{"packfiles", "states", "locks"} {
+		rclonefs.Infof(r.fs, "Creating repository directory %q in %s:%s", dir, r.typ, r.base)
 		if err := r.fs.Mkdir(ctx, dir); err != nil {
-			return fmt.Errorf("failed to mkdir %s: %w", dir, err)
+			return fmt.Errorf("failed to mkdir %s in %s:%s: %w", dir, r.typ, r.base, err)
 		}
 	}
 
